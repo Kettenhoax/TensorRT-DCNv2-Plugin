@@ -55,7 +55,7 @@ __global__ void modulated_deformable_im2col_gpu_kernel(const int n,
                                                        const int pad_h, const int pad_w,
                                                        const int stride_h, const int stride_w,
                                                        const int dilation_h, const int dilation_w,
-                                                       const int channel_per_deformable_group,
+                                                       const int channel_perdeformable_group_,
                                                        const int batch_size, const int num_channels, const int deformable_group,
                                                        const int height_col, const int width_col,
                                                        float *data_col)
@@ -71,13 +71,12 @@ __global__ void modulated_deformable_im2col_gpu_kernel(const int n,
     const int c_col = c_im * kernel_h * kernel_w;
 
     // compute deformable group index
-    const int deformable_group_index = c_im / channel_per_deformable_group;
+    const int deformable_group_index = c_im / channel_perdeformable_group_;
 
     const int h_in = h_col * stride_h - pad_h;
     const int w_in = w_col * stride_w - pad_w;
 
     float *data_col_ptr = data_col + ((c_col * batch_size + b_col) * height_col + h_col) * width_col + w_col;
-    //const float* data_im_ptr = data_im + ((b_col * num_channels + c_im) * height + h_in) * width + w_in;
     const float *data_im_ptr = data_im + (b_col * num_channels + c_im) * height * width;
     const float *data_offset_ptr = data_offset + (b_col * deformable_group + deformable_group_index) * 2 * kernel_h * kernel_w * height_col * width_col;
 
@@ -116,12 +115,12 @@ void modulated_deformable_im2col_cuda(cudaStream_t stream,
                                       const int deformable_group, float *data_col)
 {
     // num_axes should be smaller than block size
-    const int channel_per_deformable_group = channels / deformable_group;
+    const int channel_perdeformable_group_ = channels / deformable_group;
     const int num_kernels = channels * batch_size * height_col * width_col;
     modulated_deformable_im2col_gpu_kernel<<<GET_BLOCKS(num_kernels), CUDA_NUM_THREADS,
                                              0, stream>>>(
         num_kernels, data_im, data_offset, data_mask, height_im, width_im, kernel_h, kenerl_w,
-        pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, channel_per_deformable_group,
+        pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, channel_perdeformable_group_,
         batch_size, channels, deformable_group, height_col, width_col, data_col);
 
     cudaError_t err = cudaGetLastError();

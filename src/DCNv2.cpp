@@ -16,121 +16,80 @@ using nvinfer1::plugin::DCNv2PluginCreator;
     } \
 } while (0)
 
-DCNv2Plugin::DCNv2Plugin(
-  int in_channel,
-  int out_channel,
-  int kernel_H,
-  int kernel_W,
-  int deformable_group,
-  int dilation,
-  int groups,
-  int padding,
-  int stride,
-  nvinfer1::Weights const & weight, nvinfer1::Weights const & bias)
-: _in_channel(in_channel),
-  _out_channel(out_channel), _kernel_H(kernel_H), _kernel_W(kernel_W), _deformable_group(
-    deformable_group),
-  _dilation(dilation), _groups(groups), _padding(padding), _stride(stride), _initialized(false)
+void getDCNWeightDims(
+  const PluginTensorDesc & weight, int32_t & out_channel,
+  int32_t & in_channel, int32_t & kernel_size)
 {
-  if (weight.type == nvinfer1::DataType::kFLOAT) {
-    _h_weight.assign(
-      reinterpret_cast<const float *>(weight.values),
-      reinterpret_cast<const float *>(weight.values) + weight.count);
-  } else {throw std::runtime_error("Unsupported  weight dtype");}
-  if (bias.type == nvinfer1::DataType::kFLOAT) {
-    _h_bias.assign(
-      reinterpret_cast<const float *>(bias.values),
-      reinterpret_cast<const float *>(bias.values) + bias.count);
-  } else {throw std::runtime_error("Unsupported  bias dtype");}
-  cublasCreate(&_cublas_handle);
+  auto weight_dims = weight.dims;
+  // weight input dimensions: out_channel X in_channel // groups X kernel size X kernel size
+  assert(weight_dims.nbDims == 4);
+  out_channel = weight_dims.d[0];
+  in_channel = weight_dims.d[1];
+  kernel_size = weight_dims.d[2];
+  // TODO(ZeilingerM) enable h different of w?
+  assert(kernel_size == weight_dims.d[3]);
+}
+
+DCNv2Plugin::DCNv2Plugin()
+: deformable_group_(1), dilation_(1), padding_(1), stride_(1), ones_()
+{
+  cublasCreate(&cublas_handle_);
 }
 
 DCNv2Plugin::DCNv2Plugin(
-  int in_channel,
-  int out_channel,
-  int kernel_H,
-  int kernel_W,
   int deformable_group,
   int dilation,
-  int groups,
   int padding,
-  int stride,
-  const std::vector<float> & weight, const std::vector<float> & bias)
-: _in_channel(in_channel),
-  _out_channel(out_channel), _kernel_H(kernel_H), _kernel_W(kernel_W), _deformable_group(
-    deformable_group),
-  _dilation(dilation), _groups(groups), _padding(padding), _stride(stride), _initialized(false)
+  int stride)
+: DCNv2Plugin()
 {
-  _h_weight.assign(weight.begin(), weight.end());
-  _h_bias.assign(bias.begin(), bias.end());
-  cublasCreate(&_cublas_handle);
-}
-
-int32_t DCNv2Plugin::initialize() noexcept
-{
-  if (_initialized) {return 0;}
-  size_t ones_size = _output_height * _output_width * sizeof(float);
-  size_t weight_size = _h_weight.size() * sizeof(float);
-  size_t bias_size = _h_bias.size() * sizeof(float);
-  float * ones_cpu = new float[ones_size / sizeof(float)];
-  for (size_t i = 0; i < ones_size / sizeof(float); i++) {
-    ones_cpu[i] = 1.0;
-  }
-  CHECK_CUDA(
-    cudaMalloc(
-      reinterpret_cast<void **>(&_d_columns),
-      _in_channel * _kernel_H * _kernel_W * ones_size););
-  CHECK_CUDA(cudaMalloc(reinterpret_cast<void **>(&_d_ones), ones_size));
-  CHECK_CUDA(cudaMalloc(reinterpret_cast<void **>(&_d_weight), weight_size));
-  CHECK_CUDA(cudaMalloc(reinterpret_cast<void **>(&_d_bias), bias_size));
-  CHECK_CUDA(cudaMemcpy(_d_ones, ones_cpu, ones_size, cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(_d_weight, _h_weight.data(), weight_size, cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(_d_bias, _h_bias.data(), bias_size, cudaMemcpyHostToDevice));
-  delete[] ones_cpu;
-  _initialized = true;
-  return 0;
-}
-void DCNv2Plugin::terminate() noexcept
-{
-  if (!_initialized) {
-    return;
-  }
-  cudaFree(_d_columns);
-  cudaFree(_d_bias);
-  cudaFree(_d_weight);
-  cudaFree(_d_ones);
-  cublasDestroy(_cublas_handle);
-  _initialized = false;
+  deformable_group_ = deformable_group;
+  dilation_ = dilation;
+  padding_ = padding;
+  stride_ = stride;
 }
 
 DCNv2Plugin::~DCNv2Plugin()
 {
-  terminate();
+  cublasDestroy(cublas_handle_);
 }
 
 void DCNv2Plugin::configurePlugin(
   const nvinfer1::DynamicPluginTensorDesc * in, int nbInputs,
   const nvinfer1::DynamicPluginTensorDesc * out, int nbOutputs) noexcept
 {
-  assert(nbInputs == 3);
+  assert(nbInputs == 5);
   assert(nbOutputs == 1);
-  auto & input_desc = in[0].desc;
-  auto input_dims = input_desc.dims;
-  _output_height = (input_dims.d[2] + 2 * _padding - (_dilation * (_kernel_H - 1) + 1)) / _stride +
-    1;
-  _output_width = (input_dims.d[3] + 2 * _padding - (_dilation * (_kernel_H - 1) + 1)) / _stride +
-    1;
 }
 
 bool DCNv2Plugin::supportsFormatCombination(
-  int pos, const nvinfer1::PluginTensorDesc * inOut,
+  int pos, const nvinfer1::PluginTensorDesc * desc,
   int nbInputs, int nbOutputs) noexcept
 {
-  assert(nbInputs == 3);
+  assert(nbInputs == 5);
   assert(nbOutputs == 1);
   assert(pos < (nbInputs + nbOutputs));
-  return (inOut[pos].type == nvinfer1::DataType::kFLOAT) &&
-         (inOut[pos].format == nvinfer1::TensorFormat::kCHW32);
+  if (pos <= 2) {
+    // inputs
+    return (desc[pos].type == nvinfer1::DataType::kFLOAT) &&
+           (desc[pos].format == nvinfer1::TensorFormat::kCHW32);
+  }
+  if (pos == 3) {
+    // weight
+    return (desc[pos].type == nvinfer1::DataType::kFLOAT) &&
+           (desc[pos].format == nvinfer1::TensorFormat::kCHW32);
+  }
+  if (pos == 4) {
+    // bias
+    return (desc[pos].type == nvinfer1::DataType::kFLOAT) &&
+           (desc[pos].format == nvinfer1::TensorFormat::kLINEAR);
+  }
+  if (pos == 5) {
+    // output
+    return (desc[pos].type == nvinfer1::DataType::kFLOAT) &&
+           (desc[pos].format == nvinfer1::TensorFormat::kCHW32);
+  }
+  return false;
 }
 
 nvinfer1::DimsExprs DCNv2Plugin::getOutputDimensions(
@@ -140,16 +99,36 @@ nvinfer1::DimsExprs DCNv2Plugin::getOutputDimensions(
   nvinfer1::IExprBuilder & exprBuilder) noexcept
 {
   assert(outputIndex == 0);
-  assert(nbInputs == 3);
+  assert(nbInputs == 5);
+
+  // weight input dimensions: out_channel X in_channel // groups X kernel size X kernel size
+  auto weight_dims = inputs[3];
+  assert(weight_dims.nbDims == 4);
+  auto out_channel = weight_dims.d[0]->getConstantValue();
+  auto kernel_size = weight_dims.d[2]->getConstantValue();
+
   nvinfer1::DimsExprs output(inputs[0]);
   auto input_h = output.d[2]->getConstantValue();
   auto input_w = output.d[3]->getConstantValue();
-  auto output_h = (input_h + 2 * _padding - (_dilation * (_kernel_H - 1) + 1)) / _stride + 1;
-  auto output_w = (input_w + 2 * _padding - (_dilation * (_kernel_W - 1) + 1)) / _stride + 1;
-  output.d[1] = exprBuilder.constant(_out_channel);
+  auto output_h = (input_h + 2 * padding_ - (dilation_ * (kernel_size - 1) + 1)) / stride_ + 1;
+  auto output_w = (input_w + 2 * padding_ - (dilation_ * (kernel_size - 1) + 1)) / stride_ + 1;
+  output.d[1] = exprBuilder.constant(out_channel);
   output.d[2] = exprBuilder.constant(output_h);
   output.d[3] = exprBuilder.constant(output_w);
   return output;
+}
+
+void DCNv2Plugin::getDcnOutputDimensions(
+  const nvinfer1::PluginTensorDesc * inputDesc,
+  int32_t & output_h, int32_t & output_w) const
+{
+  auto input_dims = inputDesc[0].dims;
+
+  int32_t kernel_size, _ignored;
+  getDCNWeightDims(inputDesc[3], _ignored, _ignored, kernel_size);
+
+  output_h = (input_dims.d[2] + 2 * padding_ - (dilation_ * (kernel_size - 1) + 1)) / stride_ + 1;
+  output_w = (input_dims.d[3] + 2 * padding_ - (dilation_ * (kernel_size - 1) + 1)) / stride_ + 1;
 }
 
 size_t DCNv2Plugin::getWorkspaceSize(
@@ -157,7 +136,16 @@ size_t DCNv2Plugin::getWorkspaceSize(
   const nvinfer1::PluginTensorDesc * outputs,
   int nbOutputs) const noexcept
 {
-  return 0;
+  assert(nbInputs == 5);
+  assert(nbOutputs == 1);
+
+  int32_t _ignored, in_channel, kernel_size, output_h, output_w;
+  getDCNWeightDims(inputs[3], _ignored, in_channel, kernel_size);
+  getDcnOutputDimensions(inputs, output_h, output_w);
+
+  size_t ones_size = output_h * output_w * sizeof(float);
+  size_t columns_size = in_channel * kernel_size * kernel_size * ones_size;
+  return ones_size + columns_size;
 }
 
 int DCNv2Plugin::enqueue(
@@ -166,26 +154,39 @@ int DCNv2Plugin::enqueue(
   const void * const * inputs, void * const * outputs,
   void * workspace, cudaStream_t stream) noexcept
 {
-  if (!_initialized) {initialize();}
-  float alpha, beta;
-  int m, n, k;
+  // initialize inputs
 
   const float * input = static_cast<const float *>(inputs[0]);
   const float * offset = static_cast<const float *>(inputs[1]);
   const float * mask = static_cast<const float *>(inputs[2]);
-  float * output = static_cast<float *>(outputs[0]);
-  nvinfer1::Dims input_dims = inputDesc[0].dims;
-  int b = input_dims.d[0];
-  assert(b == 1);
-  int h = input_dims.d[2];
-  int w = input_dims.d[3];
-  assert(h == input_dims.d[2]);
-  assert(w == input_dims.d[3]);
+  const float * weight = static_cast<const float *>(inputs[3]);
+  const float * bias = static_cast<const float *>(inputs[4]);
 
-  int height_out = (h + 2 * _padding - (_dilation * (_kernel_H - 1) + 1)) / _stride + 1;
-  int width_out = (w + 2 * _padding - (_dilation * (_kernel_W - 1) + 1)) / _stride + 1;
-  m = _out_channel;
-  n = height_out * width_out;
+  assert(inputDesc[0].dims.nbDims == 4);
+  int h = inputDesc[0].dims.d[2];
+  int w = inputDesc[0].dims.d[3];
+
+  // initialize output
+
+  float * output = static_cast<float *>(outputs[0]);
+  int32_t out_channel, in_channel, kernel_size, output_h, output_w;
+  getDCNWeightDims(inputDesc[3], out_channel, in_channel, kernel_size);
+  getDcnOutputDimensions(inputDesc, output_h, output_w);
+
+  // initialize workspace
+
+  size_t ones_size = output_h * output_w * sizeof(float);
+  ones_.resize(output_h * output_w, 1.0);
+  CHECK_CUDA(cudaMemcpy(workspace, ones_.data(), ones_size, cudaMemcpyHostToDevice));
+  auto ones = reinterpret_cast<float *>(workspace);
+  auto columns = reinterpret_cast<float *>(workspace) + (output_h * output_w);
+
+  // run DCN
+  float alpha, beta;
+  int m, n, k;
+
+  m = out_channel;
+  n = output_h * output_w;
   k = 1;
   alpha = 1.0;
   beta = 0.0;
@@ -195,39 +196,34 @@ int DCNv2Plugin::enqueue(
   /// ones x bias = nxm
   //  add bias
   cublasSgemm(
-    _cublas_handle,
+    cublas_handle_,
     CUBLAS_OP_T, CUBLAS_OP_N,
     n, m, k, &alpha,
-    _d_ones, k,
-    _d_bias, k, &beta,
+    ones, k,
+    bias, k, &beta,
     output, n);
   // im2col (offset and mask)
   modulated_deformable_im2col_cuda(
     stream, input, offset, mask,
-    1, _in_channel, h, w,
-    height_out, width_out, _kernel_H, _kernel_W,
-    _padding, _padding, _stride, _stride, _dilation, _dilation,
-    _deformable_group, _d_columns);
-  m = _out_channel;
-  n = height_out * width_out;
-  k = _in_channel * _kernel_H * _kernel_W;
+    1, in_channel, h, w,
+    output_h, output_w, kernel_size, kernel_size,
+    padding_, padding_, stride_, stride_, dilation_, dilation_,
+    deformable_group_, columns);
+
+  k = in_channel * kernel_size * kernel_size;
   alpha = 1.0;
   beta = 1.0;
+
   // im2col conv
   cublasSgemm(
-    _cublas_handle,
+    cublas_handle_,
     CUBLAS_OP_N, CUBLAS_OP_N,
     n, m, k, &alpha,
-    _d_columns, n,
-    _d_weight, k,
+    columns, n,
+    weight, k,
     &beta,
     output, n);
   return 0;
-}
-
-void DCNv2Plugin::destroy() noexcept
-{
-  delete this;
 }
 
 nvinfer1::DataType DCNv2Plugin::getOutputDataType(
@@ -235,43 +231,28 @@ nvinfer1::DataType DCNv2Plugin::getOutputDataType(
   int nbInputs) const noexcept
 {
   assert(index == 0);
-  assert(nbInputs == 3);
+  assert(nbInputs == 5);
   assert(inputTypes[0] == nvinfer1::DataType::kFLOAT);
   return inputTypes[0];
 }
 
-
 nvinfer1::IPluginV2DynamicExt * DCNv2Plugin::clone() const noexcept
 {
-  IPluginV2DynamicExt * plugin = new DCNv2Plugin(
-    _in_channel, _out_channel,
-    _kernel_H, _kernel_W, _deformable_group,
-    _dilation, _groups, _padding, _stride,
-    _h_weight, _h_bias);
-  plugin->setPluginNamespace(_plugin_namespace);
-  return plugin;
+  return new DCNv2Plugin(deformable_group_, dilation_, padding_, stride_);
 }
 
 PluginFieldCollection DCNv2PluginCreator::mFC{};
 std::vector<PluginField> DCNv2PluginCreator::mPluginAttributes;
 
-
 DCNv2PluginCreator::DCNv2PluginCreator()
 {
-  mPluginAttributes.emplace_back(PluginField("in_channel", nullptr, PluginFieldType::kINT32, 1));
-  mPluginAttributes.emplace_back(PluginField("out_channel", nullptr, PluginFieldType::kINT32, 1));
-  mPluginAttributes.emplace_back(PluginField("kernel_h", nullptr, PluginFieldType::kINT32, 1));
-  mPluginAttributes.emplace_back(PluginField("kernel_w", nullptr, PluginFieldType::kINT32, 1));
   mPluginAttributes.emplace_back(
     PluginField(
       "deformable_group", nullptr, PluginFieldType::kINT32,
       1));
   mPluginAttributes.emplace_back(PluginField("dilation", nullptr, PluginFieldType::kINT32, 1));
-  mPluginAttributes.emplace_back(PluginField("groups", nullptr, PluginFieldType::kINT32, 1));
   mPluginAttributes.emplace_back(PluginField("padding", nullptr, PluginFieldType::kINT32, 1));
   mPluginAttributes.emplace_back(PluginField("stride", nullptr, PluginFieldType::kINT32, 1));
-  mPluginAttributes.emplace_back(PluginField("weight", nullptr, PluginFieldType::kFLOAT32, 1));
-  mPluginAttributes.emplace_back(PluginField("bias", nullptr, PluginFieldType::kFLOAT32, 1));
 
   mFC.nbFields = mPluginAttributes.size();
   mFC.fields = mPluginAttributes.data();
@@ -296,26 +277,11 @@ IPluginV2DynamicExt * DCNv2PluginCreator::createPlugin(
   const char * name,
   const nvinfer1::PluginFieldCollection * fc) noexcept
 {
-  std::vector<float> weight;
-  std::vector<float> bias;
-  int in_channel, out_channel, kernel_h, kernel_w, deformable_group, groups, padding, stride,
-    dilation;
+  int deformable_group, padding, stride, dilation;
   const PluginField * fields = fc->fields;
   for (int i = 0; i < fc->nbFields; ++i) {
     const char * attrName = fields[i].name;
-    if (!strcmp(attrName, "in_channel")) {
-      assert(fields[i].type == PluginFieldType::kINT32);
-      in_channel = *(static_cast<const int *>(fields[i].data));
-    } else if (!strcmp(attrName, "out_channel")) {
-      assert(fields[i].type == PluginFieldType::kINT32);
-      out_channel = *(static_cast<const int *>(fields[i].data));
-    } else if (!strcmp(attrName, "kernel_h")) {
-      assert(fields[i].type == PluginFieldType::kINT32);
-      kernel_h = *(static_cast<const int *>(fields[i].data));
-    } else if (!strcmp(attrName, "kernel_w")) {
-      assert(fields[i].type == PluginFieldType::kINT32);
-      kernel_w = *(static_cast<const int *>(fields[i].data));
-    } else if (!strcmp(attrName, "deformable_group")) {
+    if (!strcmp(attrName, "deformable_group")) {
       assert(fields[i].type == PluginFieldType::kINT32);
       deformable_group = *(static_cast<const int *>(fields[i].data));
     } else if (!strcmp(attrName, "dilation")) {
@@ -327,37 +293,11 @@ IPluginV2DynamicExt * DCNv2PluginCreator::createPlugin(
     } else if (!strcmp(attrName, "padding")) {
       assert(fields[i].type == PluginFieldType::kINT32);
       padding = *(static_cast<const int *>(fields[i].data));
-    } else if (!strcmp(attrName, "groups")) {
-      assert(fields[i].type == PluginFieldType::kINT32);
-      groups = *(static_cast<const int *>(fields[i].data));
-    } else if (!strcmp(attrName, "weight")) {
-      assert(fields[i].type == PluginFieldType::kFLOAT32);
-      int size = fields[i].length;
-      weight.reserve(size);
-      const auto * w = static_cast<const float *>(fields[i].data);
-      for (int j = 0; j < size; j++) {
-        weight.push_back(*w);
-        w++;
-      }
-    } else if (!strcmp(attrName, "bias")) {
-      assert(fields[i].type == PluginFieldType::kFLOAT32);
-      int size = fields[i].length;
-      bias.reserve(size);
-      const auto * w = static_cast<const float *>(fields[i].data);
-      for (int j = 0; j < size; j++) {
-        bias.push_back(*w);
-        w++;
-      }
     }
   }
 
-  Weights weight_w{DataType::kFLOAT, weight.data(), (int64_t) weight.size()};
-  Weights bias_w{DataType::kFLOAT, bias.data(), (int64_t) bias.size()};
-
-  DCNv2Plugin * obj = new DCNv2Plugin(
-    in_channel, out_channel, kernel_h, kernel_w, deformable_group,
-    dilation, groups, padding, stride, weight_w, bias_w);
-  obj->setPluginNamespace(mNamespace.c_str());
+  DCNv2Plugin * obj = new DCNv2Plugin(deformable_group, dilation, padding, stride);
+  obj->setPluginNamespace(namespace_.c_str());
   return obj;
 }
 
@@ -366,8 +306,8 @@ IPluginV2DynamicExt * DCNv2PluginCreator::deserializePlugin(
   const void * serialData,
   size_t serialLength) noexcept
 {
-  DCNv2Plugin * obj = new DCNv2Plugin{serialData, serialLength};
-  obj->setPluginNamespace(mNamespace.c_str());
+  DCNv2Plugin * obj = new DCNv2Plugin(serialData, serialLength);
+  obj->setPluginNamespace(namespace_.c_str());
   return obj;
 }
 
