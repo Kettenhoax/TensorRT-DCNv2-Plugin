@@ -35,8 +35,8 @@ private:
   int padding_;
   int stride_;
 
-  std::vector<float> ones_;
   cublasHandle_t cublas_handle_;
+  bool ones_uploaded_;
 
   DCNv2Plugin();
 

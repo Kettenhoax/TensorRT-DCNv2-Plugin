@@ -31,7 +31,7 @@ void getDCNWeightDims(
 }
 
 DCNv2Plugin::DCNv2Plugin()
-: deformable_group_(1), dilation_(1), padding_(1), stride_(1), ones_()
+: deformable_group_(1), dilation_(1), padding_(1), stride_(1), ones_uploaded_(false)
 {
   cublasCreate(&cublas_handle_);
 }
@@ -176,10 +176,14 @@ int DCNv2Plugin::enqueue(
   // initialize workspace
 
   size_t ones_size = output_h * output_w * sizeof(float);
-  ones_.resize(output_h * output_w, 1.0);
-  CHECK_CUDA(cudaMemcpy(workspace, ones_.data(), ones_size, cudaMemcpyHostToDevice));
-  auto ones = reinterpret_cast<float *>(workspace);
-  auto columns = reinterpret_cast<float *>(workspace) + (output_h * output_w);
+  if (!ones_uploaded_) {
+    std::vector<float> ones_h;
+    ones_h.resize(output_h * output_w, 1.0);
+    CHECK_CUDA(cudaMemcpy(workspace, ones_h.data(), ones_size, cudaMemcpyHostToDevice));
+    ones_uploaded_ = true;
+  }
+  auto ones = static_cast<float *>(workspace);
+  auto columns = static_cast<float *>(workspace) + (output_h * output_w);
 
   // run DCN
   float alpha, beta;
