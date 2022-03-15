@@ -16,6 +16,13 @@ using nvinfer1::plugin::DCNv2PluginCreator;
     } \
 } while (0)
 
+#define CHECK_CUBLAS(call) do { \
+  auto status = call; \
+  if (status != CUBLAS_STATUS_SUCCESS) { \
+    return status; \
+  } \
+} while(0)
+
 void getDCNWeightDims(
   const PluginTensorDesc & weight, int32_t & out_channel,
   int32_t & in_channel, int32_t & kernel_size)
@@ -179,7 +186,7 @@ int DCNv2Plugin::enqueue(
   if (!ones_uploaded_) {
     std::vector<float> ones_h;
     ones_h.resize(output_h * output_w, 1.0);
-    CHECK_CUDA(cudaMemcpy(workspace, ones_h.data(), ones_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpyAsync(workspace, ones_h.data(), ones_size, cudaMemcpyHostToDevice, stream));
     ones_uploaded_ = true;
   }
   auto ones = static_cast<float *>(workspace);
@@ -199,13 +206,16 @@ int DCNv2Plugin::enqueue(
   /// bias    1xm
   /// ones x bias = nxm
   //  add bias
-  cublasSgemm(
-    cublas_handle_,
-    CUBLAS_OP_T, CUBLAS_OP_N,
-    n, m, k, &alpha,
-    ones, k,
-    bias, k, &beta,
-    output, n);
+
+  // cublasSetStream(cublas_handle_, stream);
+  // CHECK_CUBLAS(cublasSgemm(
+  //   cublas_handle_,
+  //   CUBLAS_OP_T, CUBLAS_OP_N,
+  //   n, m, k, &alpha,
+  //   ones, k,
+  //   bias, k, &beta,
+  //   output, n));
+
   // im2col (offset and mask)
   modulated_deformable_im2col_cuda(
     stream, input, offset, mask,
@@ -214,19 +224,22 @@ int DCNv2Plugin::enqueue(
     padding_, padding_, stride_, stride_, dilation_, dilation_,
     deformable_group_, columns);
 
-  k = in_channel * kernel_size * kernel_size;
+  int out_cols = out_channel;
+  int out_rows = output_h * output_w;
+  int mult_axis = in_channel * kernel_size * kernel_size;
   alpha = 1.0;
-  beta = 1.0;
+  beta = 0.0;
 
   // im2col conv
-  cublasSgemm(
+  cublasSetStream(cublas_handle_, stream);
+  CHECK_CUBLAS(cublasSgemm(
     cublas_handle_,
     CUBLAS_OP_N, CUBLAS_OP_N,
-    n, m, k, &alpha,
-    columns, n,
-    weight, k,
+    out_rows, out_cols, mult_axis, &alpha,
+    columns, out_rows,
+    weight, mult_axis,
     &beta,
-    output, n);
+    output, out_rows));
   return 0;
 }
 
