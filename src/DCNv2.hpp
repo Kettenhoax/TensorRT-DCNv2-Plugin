@@ -79,7 +79,6 @@ public:
   : DCNv2Plugin()
   {
     this->deserialize(serialData, serialLength);
-    cublasCreate(&cublas_handle_);
   }
 
   virtual ~DCNv2Plugin();
