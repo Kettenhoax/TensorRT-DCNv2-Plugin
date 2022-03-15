@@ -72,12 +72,12 @@ bool DCNv2Plugin::supportsFormatCombination(
   if (pos <= 2) {
     // inputs
     return (desc[pos].type == nvinfer1::DataType::kFLOAT) &&
-           (desc[pos].format == nvinfer1::TensorFormat::kCHW32);
+           (desc[pos].format == nvinfer1::TensorFormat::kLINEAR); // kCHW32
   }
   if (pos == 3) {
-    // weight
+    // weights
     return (desc[pos].type == nvinfer1::DataType::kFLOAT) &&
-           (desc[pos].format == nvinfer1::TensorFormat::kCHW32);
+           (desc[pos].format == nvinfer1::TensorFormat::kLINEAR);
   }
   if (pos == 4) {
     // bias
@@ -87,7 +87,7 @@ bool DCNv2Plugin::supportsFormatCombination(
   if (pos == 5) {
     // output
     return (desc[pos].type == nvinfer1::DataType::kFLOAT) &&
-           (desc[pos].format == nvinfer1::TensorFormat::kCHW32);
+           (desc[pos].format == nvinfer1::TensorFormat::kLINEAR);
   }
   return false;
 }
